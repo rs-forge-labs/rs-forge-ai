@@ -3,6 +3,79 @@
 import { useState } from "react";
 import { scanSwiftCode, type LeakFinding } from "@/lib/scanner/swiftLeakScanner";
 
+const sampleSwiftCode = `import UIKit
+import Combine
+
+protocol PaymentDelegate: AnyObject {
+    func didCompletePayment()
+}
+
+class PaymentViewModel {
+    var delegate: PaymentDelegate?
+}
+
+class DefaultToppingsTableViewCell: UITableViewCell {
+    var addBtnTapped: ((Int) -> Void)?
+}
+
+class ProductDetailsViewController: UIViewController {
+    var cancellables = Set<AnyCancellable>()
+    var timer: Timer?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRefresh),
+            name: Notification.Name("Refresh"),
+            object: nil
+        )
+
+        timer = Timer.scheduledTimer(
+            timeInterval: 1,
+            target: self,
+            selector: #selector(handleRefresh),
+            userInfo: nil,
+            repeats: true
+        )
+
+        fetchData()
+    }
+
+    func configureCell(cell: DefaultToppingsTableViewCell) {
+        cell.addBtnTapped = { index in
+            self.addTopping(index)
+        }
+    }
+
+    func bind() {
+        Just("data")
+            .sink { value in
+                self.updateUI(value)
+            }
+            .store(in: &cancellables)
+    }
+
+    func fetchData() {
+        Task {
+            self.updateUI("Loaded")
+        }
+    }
+
+    func addTopping(_ index: Int) {
+        print("Add topping \\(index)")
+    }
+
+    func updateUI(_ value: String) {
+        print(value)
+    }
+
+    @objc func handleRefresh() {
+        print("refresh")
+    }
+}`;
+
 export default function Home() {
   const [code, setCode] = useState("");
   const [findings, setFindings] = useState<LeakFinding[]>([]);
@@ -13,6 +86,20 @@ export default function Home() {
     const result = scanSwiftCode(code);
     setFindings(result);
     setHasScanned(true);
+    setCopyStatus("");
+  };
+
+  const handleLoadSample = () => {
+    setCode(sampleSwiftCode);
+    setFindings([]);
+    setHasScanned(false);
+    setCopyStatus("");
+  };
+
+  const handleClearCode = () => {
+    setCode("");
+    setFindings([]);
+    setHasScanned(false);
     setCopyStatus("");
   };
 
@@ -97,6 +184,12 @@ ${reportItems}`;
           Xcode verification steps.
         </p>
 
+        <div className="mt-6 max-w-4xl rounded-xl border border-amber-400/30 bg-amber-400/10 p-4 text-sm text-amber-100">
+          <strong>Privacy Notice:</strong> Do not paste confidential company
+          code, API keys, tokens, customer data, private URLs, or proprietary
+          business logic. Use sanitized sample code for beta testing.
+        </div>
+
         <div className="mt-10 w-full max-w-4xl rounded-2xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl">
           <div className="grid gap-4 md:grid-cols-2">
             <div>
@@ -125,9 +218,28 @@ ${reportItems}`;
           </div>
 
           <div className="mt-5">
-            <label className="mb-2 block text-sm font-medium text-slate-300">
-              Paste Swift Code
-            </label>
+            <div className="mb-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label className="block text-sm font-medium text-slate-300">
+                Paste Swift Code
+              </label>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={handleLoadSample}
+                  className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-cyan-400 hover:text-cyan-200"
+                >
+                  Load Sample Code
+                </button>
+
+                <button
+                  onClick={handleClearCode}
+                  className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-red-400 hover:text-red-200"
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+
             <textarea
               value={code}
               onChange={(event) => setCode(event.target.value)}
@@ -138,7 +250,8 @@ ${reportItems}`;
 
           <button
             onClick={handleAnalyze}
-            className="mt-5 w-full rounded-lg bg-cyan-400 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-300"
+            disabled={code.trim().length === 0}
+            className="mt-5 w-full rounded-lg bg-cyan-400 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
           >
             Analyze Memory Risk
           </button>
