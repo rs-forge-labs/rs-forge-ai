@@ -14,6 +14,12 @@ export default function Home() {
     setHasScanned(true);
   };
 
+  const highestRisk = findings.some((finding) => finding.risk === "High")
+    ? "High"
+    : findings.some((finding) => finding.risk === "Medium")
+      ? "Medium"
+      : "Low";
+
   return (
     <main className="min-h-screen bg-slate-950 text-white">
       <section className="mx-auto flex min-h-screen max-w-6xl flex-col items-center justify-center px-6 py-16">
@@ -80,13 +86,34 @@ export default function Home() {
             <div className="mt-6 rounded-xl border border-slate-800 bg-slate-950 p-5">
               <h2 className="text-xl font-semibold">Analysis Result</h2>
 
+              <div className="mt-4 grid gap-3 md:grid-cols-3">
+                <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+                  <p className="text-sm text-slate-400">Findings</p>
+                  <p className="mt-1 text-2xl font-bold text-white">
+                    {findings.length}
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+                  <p className="text-sm text-slate-400">Highest Risk</p>
+                  <p className="mt-1 text-2xl font-bold text-white">
+                    {highestRisk}
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+                  <p className="text-sm text-slate-400">Scanner Version</p>
+                  <p className="mt-1 text-2xl font-bold text-white">v0.1</p>
+                </div>
+              </div>
+
               {findings.length === 0 ? (
-                <p className="mt-3 text-slate-400">
+                <p className="mt-5 text-slate-400">
                   No high-risk memory leak pattern detected in this first
                   scanner version.
                 </p>
               ) : (
-                <div className="mt-4 space-y-4">
+                <div className="mt-5 space-y-4">
                   {findings.map((finding) => (
                     <div
                       key={finding.id}
