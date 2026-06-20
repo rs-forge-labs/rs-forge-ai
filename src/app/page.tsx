@@ -3,6 +3,8 @@
 import { useState } from "react";
 import { scanSwiftCode, type LeakFinding } from "@/lib/scanner/swiftLeakScanner";
 
+const feedbackFormUrl = "https://forms.gle/UtAHqg1pCPpaTzPK9";
+
 const sampleSwiftCode = `import UIKit
 import Combine
 
@@ -189,6 +191,15 @@ ${reportItems}`;
           code, API keys, tokens, customer data, private URLs, or proprietary
           business logic. Use sanitized sample code for beta testing.
         </div>
+
+        <a
+          href={feedbackFormUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-4 inline-flex rounded-lg border border-cyan-400/40 px-4 py-2 text-sm font-medium text-cyan-200 transition hover:bg-cyan-400/10"
+        >
+          Share Feedback
+        </a>
 
         <div className="mt-10 w-full max-w-4xl rounded-2xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl">
           <div className="grid gap-4 md:grid-cols-2">
