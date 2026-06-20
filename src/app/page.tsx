@@ -7,11 +7,13 @@ export default function Home() {
   const [code, setCode] = useState("");
   const [findings, setFindings] = useState<LeakFinding[]>([]);
   const [hasScanned, setHasScanned] = useState(false);
+  const [copyStatus, setCopyStatus] = useState("");
 
   const handleAnalyze = () => {
     const result = scanSwiftCode(code);
     setFindings(result);
     setHasScanned(true);
+    setCopyStatus("");
   };
 
   const highestRisk = findings.some((finding) => finding.risk === "High")
@@ -19,6 +21,65 @@ export default function Home() {
     : findings.some((finding) => finding.risk === "Medium")
       ? "Medium"
       : "Low";
+
+  const buildReportText = () => {
+    if (!hasScanned) {
+      return "";
+    }
+
+    if (findings.length === 0) {
+      return `RS Forge AI - Swift Memory Leak Analysis
+
+Findings: 0
+Highest Risk: Low
+Scanner Version: v0.1
+
+No high-risk memory leak pattern detected in this first scanner version.`;
+    }
+
+    const reportItems = findings
+      .map(
+        (finding, index) => `
+${index + 1}. ${finding.title}
+Risk: ${finding.risk}
+Pattern: ${finding.pattern}
+Possible Retain Chain: ${finding.retainChain}
+
+Why:
+${finding.whyItHappens}
+
+Fix:
+${finding.fix}
+
+Xcode Verification:
+${finding.verificationSteps.map((step) => `- ${step}`).join("\n")}
+`
+      )
+      .join("\n----------------------\n");
+
+    return `RS Forge AI - Swift Memory Leak Analysis
+
+Findings: ${findings.length}
+Highest Risk: ${highestRisk}
+Scanner Version: v0.1
+
+${reportItems}`;
+  };
+
+  const handleCopyReport = async () => {
+    const reportText = buildReportText();
+
+    if (!reportText) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(reportText);
+      setCopyStatus("Copied");
+    } catch {
+      setCopyStatus("Copy failed");
+    }
+  };
 
   return (
     <main className="min-h-screen bg-slate-950 text-white">
@@ -84,7 +145,22 @@ export default function Home() {
 
           {hasScanned && (
             <div className="mt-6 rounded-xl border border-slate-800 bg-slate-950 p-5">
-              <h2 className="text-xl font-semibold">Analysis Result</h2>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <h2 className="text-xl font-semibold">Analysis Result</h2>
+
+                <div className="flex items-center gap-3">
+                  {copyStatus && (
+                    <span className="text-sm text-slate-400">{copyStatus}</span>
+                  )}
+
+                  <button
+                    onClick={handleCopyReport}
+                    className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-cyan-400 hover:text-cyan-200"
+                  >
+                    Copy Report
+                  </button>
+                </div>
+              </div>
 
               <div className="mt-4 grid gap-3 md:grid-cols-3">
                 <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
