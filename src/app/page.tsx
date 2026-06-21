@@ -116,7 +116,7 @@ export default function Home() {
 File: ${fileName.trim() || "Pasted Swift Code"}
 Findings: 0
 Highest Risk: Low
-Scanner Version: v0.2
+Scanner Version: v0.3
 
 No high-risk memory leak pattern detected in this scanner version.`;
     }
