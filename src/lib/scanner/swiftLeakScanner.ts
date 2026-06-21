@@ -12,15 +12,132 @@ export type LeakFinding = {
   verificationSteps: string[];
 };
 
+type SwiftClassInfo = {
+  name: string;
+  body: string;
+  topLevelBody: string;
+};
+
+type StrongReference = {
+  propertyName: string;
+  typeName: string;
+  isWeakOrUnowned: boolean;
+};
+
 function stripSwiftComments(code: string): string {
   return code
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/\/\/.*$/gm, "");
 }
 
-function getClassNames(code: string): string[] {
-  const matches = code.matchAll(/class\s+(\w+)/g);
-  return Array.from(matches).map((match) => match[1]);
+function findMatchingBrace(code: string, openBraceIndex: number): number {
+  let depth = 0;
+
+  for (let index = openBraceIndex; index < code.length; index += 1) {
+    const char = code[index];
+
+    if (char === "{") {
+      depth += 1;
+    }
+
+    if (char === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function getTopLevelClassBody(classBody: string): string {
+  const lines = classBody.split("\n");
+  const topLevelLines: string[] = [];
+  let depth = 0;
+
+  for (const line of lines) {
+    const depthBeforeLine = depth;
+
+    if (depthBeforeLine === 0) {
+      topLevelLines.push(line);
+    }
+
+    for (const char of line) {
+      if (char === "{") {
+        depth += 1;
+      }
+
+      if (char === "}") {
+        depth = Math.max(0, depth - 1);
+      }
+    }
+  }
+
+  return topLevelLines.join("\n");
+}
+
+function extractSwiftClasses(code: string): SwiftClassInfo[] {
+  const classes: SwiftClassInfo[] = [];
+  const classRegex = /class\s+(\w+)[^{]*\{/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = classRegex.exec(code)) !== null) {
+    const name = match[1];
+    const openBraceIndex = code.indexOf("{", match.index);
+    const closeBraceIndex = findMatchingBrace(code, openBraceIndex);
+
+    if (closeBraceIndex === -1) {
+      continue;
+    }
+
+    const body = code.slice(openBraceIndex + 1, closeBraceIndex);
+    const topLevelBody = getTopLevelClassBody(body);
+
+    classes.push({
+      name,
+      body,
+      topLevelBody
+    });
+
+    classRegex.lastIndex = closeBraceIndex + 1;
+  }
+
+  return classes;
+}
+
+function getDirectStrongReferences(
+  classInfo: SwiftClassInfo,
+  knownClassNames: string[]
+): StrongReference[] {
+  const references: StrongReference[] = [];
+
+  const propertyRegex =
+    /^\s*(?:(?:private|public|internal|fileprivate|open)\s+)?(?:(weak|unowned)\s+)?(?:var|let)\s+(\w+)\s*(?::\s*([A-Z]\w+)\??|\s*=\s*([A-Z]\w+)\s*\()/gm;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = propertyRegex.exec(classInfo.topLevelBody)) !== null) {
+    const ownershipKeyword = match[1];
+    const propertyName = match[2];
+    const explicitType = match[3];
+    const inferredType = match[4];
+    const typeName = explicitType || inferredType;
+
+    if (!typeName || !knownClassNames.includes(typeName)) {
+      continue;
+    }
+
+    references.push({
+      propertyName,
+      typeName,
+      isWeakOrUnowned:
+        ownershipKeyword === "weak" || ownershipKeyword === "unowned"
+    });
+  }
+
+  return references;
 }
 
 function hasWeakOrUnownedCapture(code: string, variableName: string): boolean {
@@ -37,6 +154,9 @@ export function scanSwiftCode(
 ): LeakFinding[] {
   const findings: LeakFinding[] = [];
   const code = stripSwiftComments(rawCode);
+
+  const classes = extractSwiftClasses(code);
+  const classNames = classes.map((swiftClass) => swiftClass.name);
 
   const hasCellClass =
     /class\s+\w+\s*:\s*(UITableViewCell|UICollectionViewCell)/.test(code);
@@ -56,7 +176,7 @@ export function scanSwiftCode(
         "ViewController → TableView/CollectionView → Cell → Closure → ViewController",
       whyItHappens:
         "The cell owns a closure property. If the parent ViewController assigns this closure and captures self strongly, the ViewController may not deallocate.",
-      fix: "Use [weak self] when assigning the closure from the parent ViewController. Also consider clearing callback closures during prepareForReuse if the cell stores user action callbacks.",
+      fix: "Use [weak self] when assigning the closure from the parent ViewController. Also clear callback closures during prepareForReuse if the cell stores user action callbacks.",
       verificationSteps: [
         "Add deinit print in the ViewController.",
         "Open the screen.",
@@ -67,31 +187,31 @@ export function scanSwiftCode(
     });
   }
 
-const strongSelfClosureMatches = Array.from(
-  code.matchAll(
-    /(?:\w+\.)?\w+\s*=\s*\{\s*(?!\[weak self\]|\[unowned self\])[^{}]*self\.[^{}]*\}/g
-  )
-);
+  const strongSelfClosureMatches = Array.from(
+    code.matchAll(
+      /(?:\w+\.)?\w+\s*=\s*\{\s*(?!\[weak self\]|\[unowned self\])[^{}]*self\.[^{}]*\}/g
+    )
+  );
 
-if (strongSelfClosureMatches.length > 0) {
-  findings.push({
-    id: "strong-self-capture",
-    title: "Strong self captured inside closure",
-    risk: "High",
-    fileName,
-    pattern: "Strong self capture",
-    retainChain: "Owner object → Closure → self",
-    whyItHappens:
-      "The closure uses self strongly. If the closure is stored by another object, self can stay in memory longer than expected.",
-    fix: "Use [weak self] or [unowned self] carefully based on lifecycle safety.",
-    verificationSteps: [
-      "Check where the closure is assigned or stored.",
-      "Add [weak self] to the closure capture list.",
-      "Run the flow again.",
-      "Confirm deinit is called."
-    ]
-  });
-}
+  if (strongSelfClosureMatches.length > 0) {
+    findings.push({
+      id: "strong-self-capture",
+      title: "Strong self captured inside closure",
+      risk: "High",
+      fileName,
+      pattern: "Strong self capture",
+      retainChain: "Owner object → Closure → self",
+      whyItHappens:
+        "The closure uses self strongly. If the closure is stored by another object, self can stay in memory longer than expected.",
+      fix: "Use [weak self] or [unowned self] carefully based on lifecycle safety.",
+      verificationSteps: [
+        "Check where the closure is assigned or stored.",
+        "Add [weak self] to the closure capture list.",
+        "Run the flow again.",
+        "Confirm deinit is called."
+      ]
+    });
+  }
 
   const hasScheduledTimer = /Timer\.scheduledTimer/.test(code);
   const hasInvalidate = /\.invalidate\(\)/.test(code);
@@ -246,58 +366,67 @@ if (strongSelfClosureMatches.length > 0) {
     }
   });
 
-  const classNames = getClassNames(code);
+  const referenceMap = new Map<string, StrongReference[]>();
 
-  for (const firstClass of classNames) {
-    for (const secondClass of classNames) {
-      if (firstClass === secondClass) {
-        continue;
+  classes.forEach((swiftClass) => {
+    referenceMap.set(
+      swiftClass.name,
+      getDirectStrongReferences(swiftClass, classNames)
+    );
+  });
+
+  classes.forEach((firstClass) => {
+    const firstReferences = referenceMap.get(firstClass.name) || [];
+
+    firstReferences.forEach((firstReference) => {
+      if (firstReference.isWeakOrUnowned) {
+        return;
       }
 
-      const firstHoldsSecond = new RegExp(
-        `class\\s+${firstClass}[\\s\\S]*var\\s+\\w+\\s*:\\s*${secondClass}\\?`
-      ).test(code);
+      const secondClassName = firstReference.typeName;
+      const secondReferences = referenceMap.get(secondClassName) || [];
 
-      const secondHoldsFirst = new RegExp(
-        `class\\s+${secondClass}[\\s\\S]*var\\s+\\w+\\s*:\\s*${firstClass}\\?`
-      ).test(code);
+      const reverseReference = secondReferences.find(
+        (reference) =>
+          reference.typeName === firstClass.name && !reference.isWeakOrUnowned
+      );
 
-      const secondUsesWeakOrUnowned = new RegExp(
-        `class\\s+${secondClass}[\\s\\S]*(weak|unowned)\\s+var\\s+\\w+\\s*:\\s*${firstClass}\\?`
-      ).test(code);
-
-      if (firstHoldsSecond && secondHoldsFirst && !secondUsesWeakOrUnowned) {
-        const findingId = `mutual-strong-reference-${firstClass}-${secondClass}`;
-
-        const alreadyAdded = findings.some(
-          (finding) =>
-            finding.id === findingId ||
-            finding.id === `mutual-strong-reference-${secondClass}-${firstClass}`
-        );
-
-        if (!alreadyAdded) {
-          findings.push({
-            id: findingId,
-            title: `Mutual strong reference between ${firstClass} and ${secondClass}`,
-            risk: "High",
-            fileName,
-            pattern: "Two-way strong reference retain cycle",
-            retainChain: `${firstClass} → ${secondClass} → ${firstClass}`,
-            whyItHappens:
-              "Both classes appear to store strong optional references to each other. If neither side is weak or unowned, setting external references to nil will not deallocate the objects.",
-            fix: "Make one side weak or unowned depending on lifecycle ownership. Usually, the child/back-reference should be weak.",
-            verificationSteps: [
-              "Add deinit print statements in both classes.",
-              "Create and link both objects.",
-              "Set external references to nil.",
-              "Confirm both deinit methods are called.",
-              "If deinit is not called, make one reference weak or unowned."
-            ]
-          });
-        }
+      if (!reverseReference) {
+        return;
       }
-    }
-  }
+
+      const findingId = `mutual-strong-reference-${firstClass.name}-${secondClassName}`;
+      const reverseFindingId = `mutual-strong-reference-${secondClassName}-${firstClass.name}`;
+
+      const alreadyAdded = findings.some(
+        (finding) =>
+          finding.id === findingId || finding.id === reverseFindingId
+      );
+
+      if (alreadyAdded) {
+        return;
+      }
+
+      findings.push({
+        id: findingId,
+        title: `Mutual strong reference between ${firstClass.name} and ${secondClassName}`,
+        risk: "High",
+        fileName,
+        pattern: "Two-way strong reference retain cycle",
+        retainChain: `${firstClass.name}.${firstReference.propertyName} → ${secondClassName}.${reverseReference.propertyName} → ${firstClass.name}`,
+        whyItHappens:
+          "Both classes store direct strong references to each other. If neither side is weak or unowned, the objects may not deallocate even after external references are removed.",
+        fix: `Make one side weak or unowned depending on lifecycle ownership. Usually, ${secondClassName}.${reverseReference.propertyName} should be weak if it is a back-reference.`,
+        verificationSteps: [
+          "Add deinit print statements in both classes.",
+          "Create and link both objects.",
+          "Set external references to nil.",
+          "Confirm both deinit methods are called.",
+          "If deinit is not called, make the back-reference weak or unowned."
+        ]
+      });
+    });
+  });
 
   return findings;
 }
