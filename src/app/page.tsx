@@ -5,93 +5,86 @@ import { scanSwiftCode, type LeakFinding } from "@/lib/scanner/swiftLeakScanner"
 
 const feedbackFormUrl = "https://forms.gle/UtAHqg1pCPpaTzPK9";
 
-const sampleSwiftCode = `import UIKit
-import Combine
+const sampleSwiftCode = `//
+//  ViewController.swift
+//  LeakyLeaks
+//
 
-protocol PaymentDelegate: AnyObject {
-    func didCompletePayment()
-}
+import UIKit
 
-class PaymentViewModel {
-    var delegate: PaymentDelegate?
-}
-
-class DefaultToppingsTableViewCell: UITableViewCell {
-    var addBtnTapped: ((Int) -> Void)?
-}
-
-class ProductDetailsViewController: UIViewController {
-    var cancellables = Set<AnyCancellable>()
-    var timer: Timer?
+class MainViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleRefresh),
-            name: Notification.Name("Refresh"),
-            object: nil
-        )
-
-        timer = Timer.scheduledTimer(
-            timeInterval: 1,
-            target: self,
-            selector: #selector(handleRefresh),
-            userInfo: nil,
-            repeats: true
-        )
-
-        fetchData()
+        navigationController?.setNavigationBarHidden(true, animated: false)
     }
 
-    func configureCell(cell: DefaultToppingsTableViewCell) {
-        cell.addBtnTapped = { index in
-            self.addTopping(index)
+    @IBAction func presentModalViewController(_ sender: Any) {
+        guard let modalViewController = UIStoryboard(name: "ModalViewController", bundle: nil).instantiateInitialViewController() as? ModalViewController else { return }
+        
+        modalViewController.closeActionHandler = {
+            modalViewController.dismiss(animated: true, completion: nil)
         }
+        
+        present(modalViewController, animated: true, completion: nil)
     }
-
-    func bind() {
-        Just("data")
-            .sink { value in
-                self.updateUI(value)
-            }
-            .store(in: &cancellables)
+    
+    @IBAction func initializeLeakyObject(_ sender: Any) {
+        var classB: ClassB? = ClassB(otherValue: "test")
+        var classA: ClassA? = ClassA(someValue: 7)
+        classA?.classB = classB
+        classB?.classA = classA
+        
+        classA = nil
+        classB = nil
     }
+}
 
-    func fetchData() {
-        Task {
-            self.updateUI("Loaded")
-        }
+class ClassA {
+    let someValue: Int
+    var classB: ClassB?
+    
+    init(someValue: Int) {
+        self.someValue = someValue
+        print("ClassA allocated")
     }
-
-    func addTopping(_ index: Int) {
-        print("Add topping \\(index)")
+    
+    deinit {
+        print("ClassA deallocated")
     }
+}
 
-    func updateUI(_ value: String) {
-        print(value)
+class ClassB {
+    let otherValue: String
+    var classA: ClassA?
+    
+    init(otherValue: String) {
+        self.otherValue = otherValue
+        print("ClassB allocated")
     }
-
-    @objc func handleRefresh() {
-        print("refresh")
+    
+    deinit {
+        print("ClassB deallocated")
     }
 }`;
 
 export default function Home() {
+  const [fileName, setFileName] = useState("ViewController.swift");
   const [code, setCode] = useState("");
   const [findings, setFindings] = useState<LeakFinding[]>([]);
   const [hasScanned, setHasScanned] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
 
   const handleAnalyze = () => {
-    const result = scanSwiftCode(code);
+    const safeFileName = fileName.trim() || "Pasted Swift Code";
+    const result = scanSwiftCode(code, safeFileName);
     setFindings(result);
     setHasScanned(true);
     setCopyStatus("");
   };
 
   const handleLoadSample = () => {
+    setFileName("ViewController.swift");
     setCode(sampleSwiftCode);
     setFindings([]);
     setHasScanned(false);
@@ -99,6 +92,7 @@ export default function Home() {
   };
 
   const handleClearCode = () => {
+    setFileName("ViewController.swift");
     setCode("");
     setFindings([]);
     setHasScanned(false);
@@ -119,17 +113,19 @@ export default function Home() {
     if (findings.length === 0) {
       return `RS Forge AI - Swift Memory Leak Analysis
 
+File: ${fileName.trim() || "Pasted Swift Code"}
 Findings: 0
 Highest Risk: Low
-Scanner Version: v0.1
+Scanner Version: v0.2
 
-No high-risk memory leak pattern detected in this first scanner version.`;
+No high-risk memory leak pattern detected in this scanner version.`;
     }
 
     const reportItems = findings
       .map(
         (finding, index) => `
 ${index + 1}. ${finding.title}
+File: ${finding.fileName}
 Risk: ${finding.risk}
 Pattern: ${finding.pattern}
 Possible Retain Chain: ${finding.retainChain}
@@ -148,9 +144,10 @@ ${finding.verificationSteps.map((step) => `- ${step}`).join("\n")}
 
     return `RS Forge AI - Swift Memory Leak Analysis
 
+File: ${fileName.trim() || "Pasted Swift Code"}
 Findings: ${findings.length}
 Highest Risk: ${highestRisk}
-Scanner Version: v0.1
+Scanner Version: v0.2
 
 ${reportItems}`;
   };
@@ -229,6 +226,18 @@ ${reportItems}`;
           </div>
 
           <div className="mt-5">
+            <label className="mb-2 block text-sm font-medium text-slate-300">
+              File Name
+            </label>
+            <input
+              value={fileName}
+              onChange={(event) => setFileName(event.target.value)}
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 font-mono text-sm text-slate-200 outline-none focus:border-cyan-400"
+              placeholder="Example: ViewController.swift"
+            />
+          </div>
+
+          <div className="mt-5">
             <div className="mb-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <label className="block text-sm font-medium text-slate-300">
                 Paste Swift Code
@@ -286,7 +295,14 @@ ${reportItems}`;
                 </div>
               </div>
 
-              <div className="mt-4 grid gap-3 md:grid-cols-3">
+              <div className="mt-4 grid gap-3 md:grid-cols-4">
+                <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+                  <p className="text-sm text-slate-400">File</p>
+                  <p className="mt-1 break-all text-sm font-semibold text-white">
+                    {fileName.trim() || "Pasted Swift Code"}
+                  </p>
+                </div>
+
                 <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
                   <p className="text-sm text-slate-400">Findings</p>
                   <p className="mt-1 text-2xl font-bold text-white">
@@ -303,14 +319,14 @@ ${reportItems}`;
 
                 <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
                   <p className="text-sm text-slate-400">Scanner Version</p>
-                  <p className="mt-1 text-2xl font-bold text-white">v0.1</p>
+                  <p className="mt-1 text-2xl font-bold text-white">v0.2</p>
                 </div>
               </div>
 
               {findings.length === 0 ? (
                 <p className="mt-5 text-slate-400">
-                  No high-risk memory leak pattern detected in this first
-                  scanner version.
+                  No high-risk memory leak pattern detected in this scanner
+                  version.
                 </p>
               ) : (
                 <div className="mt-5 space-y-4">
@@ -330,6 +346,10 @@ ${reportItems}`;
                       </div>
 
                       <p className="mt-3 text-sm text-slate-300">
+                        <strong>File:</strong> {finding.fileName}
+                      </p>
+
+                      <p className="mt-2 text-sm text-slate-300">
                         <strong>Pattern:</strong> {finding.pattern}
                       </p>
 
