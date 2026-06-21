@@ -147,7 +147,7 @@ ${finding.verificationSteps.map((step) => `- ${step}`).join("\n")}
 File: ${fileName.trim() || "Pasted Swift Code"}
 Findings: ${findings.length}
 Highest Risk: ${highestRisk}
-Scanner Version: v0.2
+Scanner Version: v0.3
 
 ${reportItems}`;
   };
@@ -319,7 +319,7 @@ ${reportItems}`;
 
                 <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
                   <p className="text-sm text-slate-400">Scanner Version</p>
-                  <p className="mt-1 text-2xl font-bold text-white">v0.2</p>
+                  <p className="mt-1 text-2xl font-bold text-white">v0.3</p>
                 </div>
               </div>
 
