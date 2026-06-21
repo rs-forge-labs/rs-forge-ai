@@ -14,6 +14,7 @@ export type LeakFinding = {
 
 type SwiftClassInfo = {
   name: string;
+  declaration: string;
   body: string;
   topLevelBody: string;
 };
@@ -22,6 +23,11 @@ type StrongReference = {
   propertyName: string;
   typeName: string;
   isWeakOrUnowned: boolean;
+};
+
+type ClosureProperty = {
+  name: string;
+  signature: string;
 };
 
 function stripSwiftComments(code: string): string {
@@ -80,11 +86,12 @@ function getTopLevelClassBody(classBody: string): string {
 
 function extractSwiftClasses(code: string): SwiftClassInfo[] {
   const classes: SwiftClassInfo[] = [];
-  const classRegex = /class\s+(\w+)[^{]*\{/g;
+  const classRegex = /(?:final\s+)?class\s+(\w+)[^{]*\{/g;
   let match: RegExpExecArray | null;
 
   while ((match = classRegex.exec(code)) !== null) {
     const name = match[1];
+    const declaration = match[0];
     const openBraceIndex = code.indexOf("{", match.index);
     const closeBraceIndex = findMatchingBrace(code, openBraceIndex);
 
@@ -97,6 +104,7 @@ function extractSwiftClasses(code: string): SwiftClassInfo[] {
 
     classes.push({
       name,
+      declaration,
       body,
       topLevelBody
     });
@@ -140,12 +148,331 @@ function getDirectStrongReferences(
   return references;
 }
 
+function getClosureProperties(classInfo: SwiftClassInfo): ClosureProperty[] {
+  const properties: ClosureProperty[] = [];
+
+  const closurePropertyRegex =
+    /^\s*(?:(?:private|public|internal|fileprivate|open)\s+)?var\s+(\w+)\s*:\s*(\(\(.*?\)\s*->\s*.*?\)\?|\(\(.*?\)\s*->\s*Void\)\?|\(\(.*?\)\s*->\s*\w+\)\?)/gm;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = closurePropertyRegex.exec(classInfo.topLevelBody)) !== null) {
+    properties.push({
+      name: match[1],
+      signature: match[2]
+    });
+  }
+
+  return properties;
+}
+
+function hasWeakOrUnownedSelfCapture(closureText: string): boolean {
+  return /\{\s*\[[^\]]*(weak|unowned)\s+self[^\]]*\]/.test(closureText);
+}
+
 function hasWeakOrUnownedCapture(code: string, variableName: string): boolean {
   const weakPattern = new RegExp(
     `\\{\\s*\$begin:math:display$\[\^\\$end:math:display$]*(weak|unowned)\\s+${variableName}[^\\]]*\\]`
   );
 
   return weakPattern.test(code);
+}
+
+function getMethodBody(classBody: string, methodName: string): string | null {
+  const methodRegex = new RegExp(
+    `(?:override\\s+)?func\\s+${methodName}\\s*\$begin:math:text$\[\^\)\]\*\\$end:math:text$\\s*\\{`
+  );
+
+  const match = methodRegex.exec(classBody);
+
+  if (!match) {
+    return null;
+  }
+
+  const openBraceIndex = classBody.indexOf("{", match.index);
+  const closeBraceIndex = findMatchingBrace(classBody, openBraceIndex);
+
+  if (closeBraceIndex === -1) {
+    return null;
+  }
+
+  return classBody.slice(openBraceIndex + 1, closeBraceIndex);
+}
+
+function sanitizeId(value: string): string {
+  return value
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
+function addFindingOnce(findings: LeakFinding[], finding: LeakFinding): void {
+  const alreadyExists = findings.some((item) => item.id === finding.id);
+
+  if (!alreadyExists) {
+    findings.push(finding);
+  }
+}
+
+function getClosureAssignmentFindings(
+  classInfo: SwiftClassInfo,
+  fileName: string
+): LeakFinding[] {
+  const findings: LeakFinding[] = [];
+
+  const closureAssignmentRegex =
+    /(?:(?:let|var)\s+)?(?:(\w+)\.)?(\w+)\s*=\s*\{([\s\S]*?)\n\s*\}/g;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = closureAssignmentRegex.exec(classInfo.body)) !== null) {
+    const objectName = match[1];
+    const closureName = match[2];
+    const closureBody = match[3];
+    const fullClosureText = match[0];
+
+    const capturesSelf = /\bself\./.test(closureBody);
+
+    if (!capturesSelf || hasWeakOrUnownedSelfCapture(fullClosureText)) {
+      continue;
+    }
+
+    const targetName = objectName
+      ? `${objectName}.${closureName}`
+      : closureName;
+
+    const isLocalCompletion = !objectName && closureName === "completion";
+
+    const title = isLocalCompletion
+      ? `${classInfo.name}.${closureName} closure captures ${classInfo.name} strongly`
+      : `${targetName} captures ${classInfo.name} strongly`;
+
+    const retainChain = objectName
+      ? `${classInfo.name} → ${targetName} closure → ${classInfo.name}`
+      : `${classInfo.name} → ${closureName} closure → ${classInfo.name}`;
+
+    addFindingOnce(findings, {
+      id: `specific-closure-capture-${sanitizeId(classInfo.name)}-${sanitizeId(
+        targetName
+      )}`,
+      title,
+      risk: "High",
+      fileName,
+      pattern: "Specific strong self closure capture",
+      retainChain,
+      whyItHappens:
+        "This closure references self strongly. If the closure is stored by another object or by the same owner, the owner can remain in memory after the screen or object should deallocate.",
+      fix: objectName
+        ? `Use [weak self] in the ${targetName} closure and call self safely.`
+        : `Use [weak self] in the ${closureName} closure and call self safely.`,
+      verificationSteps: [
+        `Add deinit print in ${classInfo.name}.`,
+        `Update ${targetName} to capture self weakly.`,
+        "Run the same navigation or repeated flow.",
+        "Close the screen or release the object.",
+        "Confirm deinit is called and Memory Graph no longer shows the retained object."
+      ]
+    });
+  }
+
+  return findings;
+}
+
+function getStoredClosureCollectionFindings(
+  classInfo: SwiftClassInfo,
+  fileName: string
+): LeakFinding[] {
+  const findings: LeakFinding[] = [];
+
+  const closureCollectionRegex =
+    /^\s*(?:(?:private|public|internal|fileprivate|open)\s+)?var\s+(\w+)\s*:\s*\[[^\]]*->\s*[^\]]+\]\s*=\s*(\[\]|\[:\])/gm;
+
+  let collectionMatch: RegExpExecArray | null;
+
+  while (
+    (collectionMatch = closureCollectionRegex.exec(classInfo.topLevelBody)) !==
+    null
+  ) {
+    const collectionName = collectionMatch[1];
+
+    const appendPattern = new RegExp(`${collectionName}\\.append\\s*\\(`);
+    const dictionaryStorePattern = new RegExp(`${collectionName}\\s*\$begin:math:display$\[\^\\$end:math:display$]+\\]\\s*=`);
+
+    const storesClosure =
+      appendPattern.test(classInfo.body) || dictionaryStorePattern.test(classInfo.body);
+
+    if (!storesClosure) {
+      continue;
+    }
+
+    const hasCleanup =
+      new RegExp(`${collectionName}\\.removeAll\\s*\\(`).test(classInfo.body) ||
+      new RegExp(`${collectionName}\\.removeValue\\s*\\(`).test(classInfo.body) ||
+      new RegExp(`${collectionName}\\s*\$begin:math:display$\[\^\\$end:math:display$]+\\]\\s*=\\s*nil`).test(
+        classInfo.body
+      );
+
+    if (hasCleanup) {
+      continue;
+    }
+
+    const isSingleton = /static\s+let\s+shared\s*=/.test(classInfo.topLevelBody);
+
+    addFindingOnce(findings, {
+      id: `stored-closure-collection-${sanitizeId(classInfo.name)}-${sanitizeId(
+        collectionName
+      )}`,
+      title: isSingleton
+        ? `${classInfo.name}.shared stores callbacks in ${collectionName} without cleanup`
+        : `${classInfo.name}.${collectionName} stores closures without cleanup`,
+      risk: isSingleton ? "High" : "High",
+      fileName,
+      pattern: "Stored escaping closure collection",
+      retainChain: isSingleton
+        ? `${classInfo.name}.shared → ${collectionName} → stored closure → captured objects`
+        : `${classInfo.name} → ${collectionName} → stored closure → captured objects`,
+      whyItHappens:
+        "The class stores escaping closures inside an array or dictionary and no cleanup/removal was detected. If those closures capture self or other objects, memory can grow across repeated flows.",
+      fix: "Avoid storing completion closures unless required. If storage is required, store them by identifier and remove each closure after execution or cancellation.",
+      verificationSteps: [
+        "Check whether the collection grows after repeated requests.",
+        "Remove callbacks after execution.",
+        "Run the flow multiple times.",
+        "Monitor memory footprint and confirm it does not continuously increase.",
+        "Use Memory Graph to check whether old closures remain retained."
+      ]
+    });
+  }
+
+  return findings;
+}
+
+function getPrepareForReuseFindings(
+  classInfo: SwiftClassInfo,
+  fileName: string
+): LeakFinding[] {
+  const findings: LeakFinding[] = [];
+
+  const isCell =
+    /UITableViewCell|UICollectionViewCell/.test(classInfo.declaration);
+
+  if (!isCell) {
+    return findings;
+  }
+
+  const closureProperties = getClosureProperties(classInfo);
+  const hasLoaderProperty =
+    /^\s*(?:(?:private|public|internal|fileprivate|open)\s+)?var\s+\w*loader\w*\s*:/gim.test(
+      classInfo.topLevelBody
+    );
+
+  if (closureProperties.length === 0 && !hasLoaderProperty) {
+    return findings;
+  }
+
+  const prepareForReuseBody = getMethodBody(classInfo.body, "prepareForReuse");
+
+  if (!prepareForReuseBody) {
+    addFindingOnce(findings, {
+      id: `missing-prepare-for-reuse-${sanitizeId(classInfo.name)}`,
+      title: `${classInfo.name} stores callbacks but does not implement prepareForReuse cleanup`,
+      risk: "High",
+      fileName,
+      pattern: "Reusable cell cleanup risk",
+      retainChain:
+        "TableView/CollectionView → Reused Cell → old callback/loader → old owner",
+      whyItHappens:
+        "Reusable cells can keep old callbacks, loaders, or image requests alive if they are not cleared before reuse.",
+      fix: "Implement prepareForReuse and clear closure callbacks, loader references, image references, and any pending request state.",
+      verificationSteps: [
+        "Scroll the list repeatedly.",
+        "Check whether old cells remain in Memory Graph.",
+        "Add prepareForReuse cleanup.",
+        "Confirm callbacks and loader references are set to nil.",
+        "Retest scrolling and screen dismissal."
+      ]
+    });
+
+    return findings;
+  }
+
+  const missingClosureCleanups = closureProperties.filter((property) => {
+    const nilPattern = new RegExp(`${property.name}\\s*=\\s*nil`);
+    return !nilPattern.test(prepareForReuseBody);
+  });
+
+  const missingLoaderCleanup =
+    hasLoaderProperty && !/\w*loader\w*\s*=\s*nil/i.test(prepareForReuseBody);
+
+  if (missingClosureCleanups.length > 0 || missingLoaderCleanup) {
+    const missingNames = [
+      ...missingClosureCleanups.map((property) => property.name),
+      ...(missingLoaderCleanup ? ["loader reference"] : [])
+    ];
+
+    addFindingOnce(findings, {
+      id: `incomplete-prepare-for-reuse-${sanitizeId(classInfo.name)}`,
+      title: `${classInfo.name} prepareForReuse may not clear stored callbacks/loaders`,
+      risk: "High",
+      fileName,
+      pattern: "Incomplete reusable cell cleanup",
+      retainChain:
+        "TableView/CollectionView → Reused Cell → old closure/loader → old owner",
+      whyItHappens:
+        "The cell stores callbacks or loader references, but prepareForReuse does not appear to clear all of them. Old closures can keep previous owners, images, or loaders alive.",
+      fix: `Clear these during prepareForReuse: ${missingNames.join(", ")}.`,
+      verificationSteps: [
+        "Add cleanup for all callback closures.",
+        "Clear loader completion and loader back-references if present.",
+        "Set image references to nil where applicable.",
+        "Scroll the list repeatedly.",
+        "Confirm reused cells do not keep old callbacks in Memory Graph."
+      ]
+    });
+  }
+
+  return findings;
+}
+
+function getCacheGrowthFindings(
+  classInfo: SwiftClassInfo,
+  fileName: string
+): LeakFinding[] {
+  const findings: LeakFinding[] = [];
+
+  const isSingleton = /static\s+let\s+shared\s*=/.test(classInfo.topLevelBody);
+  const hasUIImageDictionary =
+    /var\s+\w+\s*:\s*\[[^\]]*:\s*UIImage\]\s*=\s*\[:\]/.test(
+      classInfo.topLevelBody
+    );
+  const usesNSCache = /NSCache\s*</.test(classInfo.body);
+  const hasEviction =
+    /removeAll\s*\(|removeValue\s*\(|countLimit|totalCostLimit/.test(
+      classInfo.body
+    );
+
+  if (isSingleton && hasUIImageDictionary && !usesNSCache && !hasEviction) {
+    addFindingOnce(findings, {
+      id: `singleton-image-cache-growth-${sanitizeId(classInfo.name)}`,
+      title: `${classInfo.name}.shared image dictionary may grow without eviction`,
+      risk: "Medium",
+      fileName,
+      pattern: "Unbounded image cache growth",
+      retainChain: `${classInfo.name}.shared → image dictionary → UIImage objects`,
+      whyItHappens:
+        "The singleton stores UIImage objects in a dictionary and no eviction or memory-pressure cleanup was detected. This can increase memory usage over repeated image loads.",
+      fix: "Use NSCache for image caching or add explicit eviction, size limits, and memory warning cleanup.",
+      verificationSteps: [
+        "Load many unique images.",
+        "Watch memory footprint in Xcode.",
+        "Replace dictionary cache with NSCache or add eviction.",
+        "Retest repeated flows.",
+        "Confirm memory stabilizes instead of continuously growing."
+      ]
+    });
+  }
+
+  return findings;
 }
 
 export function scanSwiftCode(
@@ -187,31 +514,23 @@ export function scanSwiftCode(
     });
   }
 
-  const strongSelfClosureMatches = Array.from(
-    code.matchAll(
-      /(?:\w+\.)?\w+\s*=\s*\{\s*(?!\[weak self\]|\[unowned self\])[^{}]*self\.[^{}]*\}/g
-    )
-  );
+  classes.forEach((swiftClass) => {
+    getClosureAssignmentFindings(swiftClass, fileName).forEach((finding) =>
+      addFindingOnce(findings, finding)
+    );
 
-  if (strongSelfClosureMatches.length > 0) {
-    findings.push({
-      id: "strong-self-capture",
-      title: "Strong self captured inside closure",
-      risk: "High",
-      fileName,
-      pattern: "Strong self capture",
-      retainChain: "Owner object → Closure → self",
-      whyItHappens:
-        "The closure uses self strongly. If the closure is stored by another object, self can stay in memory longer than expected.",
-      fix: "Use [weak self] or [unowned self] carefully based on lifecycle safety.",
-      verificationSteps: [
-        "Check where the closure is assigned or stored.",
-        "Add [weak self] to the closure capture list.",
-        "Run the flow again.",
-        "Confirm deinit is called."
-      ]
-    });
-  }
+    getStoredClosureCollectionFindings(swiftClass, fileName).forEach(
+      (finding) => addFindingOnce(findings, finding)
+    );
+
+    getPrepareForReuseFindings(swiftClass, fileName).forEach((finding) =>
+      addFindingOnce(findings, finding)
+    );
+
+    getCacheGrowthFindings(swiftClass, fileName).forEach((finding) =>
+      addFindingOnce(findings, finding)
+    );
+  });
 
   const hasScheduledTimer = /Timer\.scheduledTimer/.test(code);
   const hasInvalidate = /\.invalidate\(\)/.test(code);
@@ -346,7 +665,7 @@ export function scanSwiftCode(
     const hasWeakCapture = hasWeakOrUnownedCapture(match[0], objectName);
 
     if (closureUsesObject && !hasWeakCapture) {
-      findings.push({
+      addFindingOnce(findings, {
         id: `object-closure-capture-${objectName}-${closureProperty}`,
         title: `Closure captures ${objectName} strongly`,
         risk: "High",
