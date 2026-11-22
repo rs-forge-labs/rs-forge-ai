@@ -160,3 +160,7 @@ Success criteria:
 RS Forge AI is inspired by real production iOS memory debugging experience from large food-ordering and kiosk applications, where memory growth, retain cycles, and long-running flows can create serious production issues.
 
 The goal is to make iOS memory debugging easier by explaining not only what might be wrong, but why it happens and how to verify the fix.
+
+## License
+
+MIT License. Copyright © 2026 RS Forge Labs. See [LICENSE](LICENSE).
