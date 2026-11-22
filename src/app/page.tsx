@@ -1,72 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { scanSwiftCode, type LeakFinding } from "@/lib/scanner/swiftLeakScanner";
+import { sampleSwiftCode } from "@/lib/scanner/sampleSwiftCode";
+import {
+  SCANNER_VERSION,
+  scanSwiftCode,
+  type LeakFinding
+} from "@/lib/scanner/swiftLeakScanner";
 
 const feedbackFormUrl = "https://forms.gle/UtAHqg1pCPpaTzPK9";
-
-const sampleSwiftCode = `//
-//  ViewController.swift
-//  LeakyLeaks
-//
-
-import UIKit
-
-class MainViewController: UIViewController {
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        navigationController?.setNavigationBarHidden(true, animated: false)
-    }
-
-    @IBAction func presentModalViewController(_ sender: Any) {
-        guard let modalViewController = UIStoryboard(name: "ModalViewController", bundle: nil).instantiateInitialViewController() as? ModalViewController else { return }
-        
-        modalViewController.closeActionHandler = {
-            modalViewController.dismiss(animated: true, completion: nil)
-        }
-        
-        present(modalViewController, animated: true, completion: nil)
-    }
-    
-    @IBAction func initializeLeakyObject(_ sender: Any) {
-        var classB: ClassB? = ClassB(otherValue: "test")
-        var classA: ClassA? = ClassA(someValue: 7)
-        classA?.classB = classB
-        classB?.classA = classA
-        
-        classA = nil
-        classB = nil
-    }
-}
-
-class ClassA {
-    let someValue: Int
-    var classB: ClassB?
-    
-    init(someValue: Int) {
-        self.someValue = someValue
-        print("ClassA allocated")
-    }
-    
-    deinit {
-        print("ClassA deallocated")
-    }
-}
-
-class ClassB {
-    let otherValue: String
-    var classA: ClassA?
-    
-    init(otherValue: String) {
-        self.otherValue = otherValue
-        print("ClassB allocated")
-    }
-    
-    deinit {
-        print("ClassB deallocated")
-    }
-}`;
 
 export default function Home() {
   const [fileName, setFileName] = useState("ViewController.swift");
@@ -116,7 +58,7 @@ export default function Home() {
 File: ${fileName.trim() || "Pasted Swift Code"}
 Findings: 0
 Highest Risk: Low
-Scanner Version: v0.4
+Scanner Version: ${SCANNER_VERSION}
 
 No high-risk memory leak pattern detected in this scanner version.`;
     }
@@ -147,7 +89,7 @@ ${finding.verificationSteps.map((step) => `- ${step}`).join("\n")}
 File: ${fileName.trim() || "Pasted Swift Code"}
 Findings: ${findings.length}
 Highest Risk: ${highestRisk}
-Scanner Version: v0.4
+Scanner Version: ${SCANNER_VERSION}
 
 ${reportItems}`;
   };
@@ -319,7 +261,7 @@ ${reportItems}`;
 
                 <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
                   <p className="text-sm text-slate-400">Scanner Version</p>
-                  <p className="mt-1 text-2xl font-bold text-white">v0.4</p>
+                  <p className="mt-1 text-2xl font-bold text-white">{SCANNER_VERSION}</p>
                 </div>
               </div>
 

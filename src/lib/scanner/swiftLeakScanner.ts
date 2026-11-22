@@ -1,3 +1,5 @@
+export const SCANNER_VERSION = "v0.4.1";
+
 export type RiskLevel = "Low" | "Medium" | "High";
 
 export type LeakFinding = {
@@ -12,9 +14,22 @@ export type LeakFinding = {
   verificationSteps: string[];
 };
 
-type SwiftClassInfo = {
+type SwiftBlock = {
   name: string;
   declaration: string;
+  body: string;
+  start: number;
+  end: number;
+};
+
+type SwiftClassInfo = SwiftBlock & {
+  topLevelBody: string;
+};
+
+// The code a lifecycle check looks at: one class plus its extensions, or the
+// code outside any class (name is null).
+type ScanScope = {
+  name: string | null;
   body: string;
   topLevelBody: string;
 };
@@ -36,17 +51,22 @@ function stripSwiftComments(code: string): string {
     .replace(/\/\/.*$/gm, "");
 }
 
-function findMatchingBrace(code: string, openBraceIndex: number): number {
+function findMatchingBrace(
+  code: string,
+  openBraceIndex: number,
+  open = "{",
+  close = "}"
+): number {
   let depth = 0;
 
   for (let index = openBraceIndex; index < code.length; index += 1) {
     const char = code[index];
 
-    if (char === "{") {
+    if (char === open) {
       depth += 1;
     }
 
-    if (char === "}") {
+    if (char === close) {
       depth -= 1;
 
       if (depth === 0) {
@@ -84,35 +104,98 @@ function getTopLevelClassBody(classBody: string): string {
   return topLevelLines.join("\n");
 }
 
-function extractSwiftClasses(code: string): SwiftClassInfo[] {
-  const classes: SwiftClassInfo[] = [];
-  const classRegex = /(?:final\s+)?class\s+(\w+)[^{]*\{/g;
+// blockRegex must be global, capture the name in group 1, and end at the
+// block's opening brace.
+function extractSwiftBlocks(code: string, blockRegex: RegExp): SwiftBlock[] {
+  const blocks: SwiftBlock[] = [];
   let match: RegExpExecArray | null;
 
-  while ((match = classRegex.exec(code)) !== null) {
-    const name = match[1];
-    const declaration = match[0];
-    const openBraceIndex = code.indexOf("{", match.index);
+  while ((match = blockRegex.exec(code)) !== null) {
+    const openBraceIndex = match.index + match[0].length - 1;
     const closeBraceIndex = findMatchingBrace(code, openBraceIndex);
 
     if (closeBraceIndex === -1) {
       continue;
     }
 
-    const body = code.slice(openBraceIndex + 1, closeBraceIndex);
-    const topLevelBody = getTopLevelClassBody(body);
-
-    classes.push({
-      name,
-      declaration,
-      body,
-      topLevelBody
+    blocks.push({
+      name: match[1],
+      declaration: match[0],
+      body: code.slice(openBraceIndex + 1, closeBraceIndex),
+      start: match.index,
+      end: closeBraceIndex + 1
     });
 
-    classRegex.lastIndex = closeBraceIndex + 1;
+    blockRegex.lastIndex = closeBraceIndex + 1;
   }
 
-  return classes;
+  return blocks;
+}
+
+function extractSwiftClasses(code: string): SwiftClassInfo[] {
+  // The lookahead skips `class func` / `class var`, which are not types.
+  return extractSwiftBlocks(
+    code,
+    /\b(?:final\s+)?class\s+(?!func\b|var\b|let\b)(\w+)[^{]*\{/g
+  ).map((block) => ({
+    ...block,
+    topLevelBody: getTopLevelClassBody(block.body)
+  }));
+}
+
+function getScanScopes(code: string, classes: SwiftClassInfo[]): ScanScope[] {
+  if (classes.length === 0) {
+    return [
+      { name: null, body: code, topLevelBody: getTopLevelClassBody(code) }
+    ];
+  }
+
+  const extensions = extractSwiftBlocks(code, /\bextension\s+(\w+)[^{]*\{/g);
+  const coveredRanges: Array<[number, number]> = [];
+
+  const scopes: ScanScope[] = classes.map((swiftClass) => {
+    const ownExtensions = extensions.filter(
+      (extension) => extension.name === swiftClass.name
+    );
+
+    coveredRanges.push([swiftClass.start, swiftClass.end]);
+    ownExtensions.forEach((extension) =>
+      coveredRanges.push([extension.start, extension.end])
+    );
+
+    return {
+      name: swiftClass.name,
+      body: [swiftClass.body, ...ownExtensions.map((ext) => ext.body)].join(
+        "\n"
+      ),
+      topLevelBody: swiftClass.topLevelBody
+    };
+  });
+
+  coveredRanges.sort((a, b) => a[0] - b[0]);
+
+  let remainingCode = "";
+  let cursor = 0;
+
+  for (const [start, end] of coveredRanges) {
+    if (start > cursor) {
+      remainingCode += `${code.slice(cursor, start)}\n`;
+    }
+
+    cursor = Math.max(cursor, end);
+  }
+
+  remainingCode += code.slice(cursor);
+
+  if (remainingCode.trim()) {
+    scopes.push({
+      name: null,
+      body: remainingCode,
+      topLevelBody: getTopLevelClassBody(remainingCode)
+    });
+  }
+
+  return scopes;
 }
 
 function getDirectStrongReferences(
@@ -172,15 +255,86 @@ function hasWeakOrUnownedSelfCapture(closureText: string): boolean {
 
 function hasWeakOrUnownedCapture(code: string, variableName: string): boolean {
   const weakPattern = new RegExp(
-    `\\{\\s*\$begin:math:display$\[\^\\$end:math:display$]*(weak|unowned)\\s+${variableName}[^\\]]*\\]`
+    `\\{\\s*\\[[^\\]]*(weak|unowned)\\s+${variableName}[^\\]]*\\]`
   );
 
   return weakPattern.test(code);
 }
 
+// closure must start at its opening brace. Checks only the closure's own
+// capture list: a [weak self] in a nested closure still makes this one
+// capture self strongly.
+function capturesSelfStrongly(closure: string): boolean {
+  const weakSelfCapture =
+    /^\{\s*(?:@\w+\s+)?\[[^\]]*\b(?:weak|unowned(?:\([^)]*\))?)\s+self\b/;
+
+  return !weakSelfCapture.test(closure) && /\bself\b/.test(closure);
+}
+
+function getTopLevelBraceBlocks(text: string): string[] {
+  const blocks: string[] = [];
+
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "{") {
+      continue;
+    }
+
+    const closeBraceIndex = findMatchingBrace(text, index);
+
+    if (closeBraceIndex === -1) {
+      break;
+    }
+
+    blocks.push(text.slice(index, closeBraceIndex + 1));
+    index = closeBraceIndex;
+  }
+
+  return blocks;
+}
+
+// Returns the closures passed to each call matched by callRegex: closure
+// arguments inside the parentheses and any trailing closure. callRegex must
+// be global and end at the call's opening "(" or "{".
+function getCallClosures(code: string, callRegex: RegExp): string[] {
+  const closures: string[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = callRegex.exec(code)) !== null) {
+    let openIndex = match.index + match[0].length - 1;
+
+    if (code[openIndex] === "(") {
+      const closeParenIndex = findMatchingBrace(code, openIndex, "(", ")");
+
+      if (closeParenIndex === -1) {
+        continue;
+      }
+
+      closures.push(
+        ...getTopLevelBraceBlocks(code.slice(openIndex + 1, closeParenIndex))
+      );
+
+      const trailingClosure = /^\s*\{/.exec(code.slice(closeParenIndex + 1));
+
+      if (!trailingClosure) {
+        continue;
+      }
+
+      openIndex = closeParenIndex + trailingClosure[0].length;
+    }
+
+    const closeBraceIndex = findMatchingBrace(code, openIndex);
+
+    if (closeBraceIndex !== -1) {
+      closures.push(code.slice(openIndex, closeBraceIndex + 1));
+    }
+  }
+
+  return closures;
+}
+
 function getMethodBody(classBody: string, methodName: string): string | null {
   const methodRegex = new RegExp(
-    `(?:override\\s+)?func\\s+${methodName}\\s*\$begin:math:text$\[\^\)\]\*\\$end:math:text$\\s*\\{`
+    `(?:override\\s+)?func\\s+${methodName}\\s*\\([^)]*\\)\\s*\\{`
   );
 
   const match = methodRegex.exec(classBody);
@@ -296,7 +450,10 @@ function getStoredClosureCollectionFindings(
     const collectionName = collectionMatch[1];
 
     const appendPattern = new RegExp(`${collectionName}\\.append\\s*\\(`);
-    const dictionaryStorePattern = new RegExp(`${collectionName}\\s*\$begin:math:display$\[\^\\$end:math:display$]+\\]\\s*=`);
+    // `handlers[id] = closure`, but not `handlers[id] = nil` or `==`.
+    const dictionaryStorePattern = new RegExp(
+      `${collectionName}\\s*\\[[^\\]]+\\]\\s*=(?!=)(?!\\s*nil\\b)`
+    );
 
     const storesClosure =
       appendPattern.test(classInfo.body) || dictionaryStorePattern.test(classInfo.body);
@@ -308,7 +465,7 @@ function getStoredClosureCollectionFindings(
     const hasCleanup =
       new RegExp(`${collectionName}\\.removeAll\\s*\\(`).test(classInfo.body) ||
       new RegExp(`${collectionName}\\.removeValue\\s*\\(`).test(classInfo.body) ||
-      new RegExp(`${collectionName}\\s*\$begin:math:display$\[\^\\$end:math:display$]+\\]\\s*=\\s*nil`).test(
+      new RegExp(`${collectionName}\\s*\\[[^\\]]+\\]\\s*=\\s*nil\\b`).test(
         classInfo.body
       );
 
@@ -325,7 +482,7 @@ function getStoredClosureCollectionFindings(
       title: isSingleton
         ? `${classInfo.name}.shared stores callbacks in ${collectionName} without cleanup`
         : `${classInfo.name}.${collectionName} stores closures without cleanup`,
-      risk: isSingleton ? "High" : "High",
+      risk: "High",
       fileName,
       pattern: "Stored escaping closure collection",
       retainChain: isSingleton
@@ -475,6 +632,225 @@ function getCacheGrowthFindings(
   return findings;
 }
 
+// When the code that assigns a cell's callbacks is in the scan, the closure
+// capture rules check those assignments directly. This rule only covers
+// callbacks whose assignment the scanner cannot see.
+function getCellCallbackFindings(
+  classInfo: SwiftClassInfo,
+  code: string,
+  fileName: string
+): LeakFinding[] {
+  const isCell =
+    /UITableViewCell|UICollectionViewCell/.test(classInfo.declaration);
+
+  if (!isCell) {
+    return [];
+  }
+
+  const unassignedCallbacks = getClosureProperties(classInfo)
+    .map((property) => property.name)
+    .filter((name) => !new RegExp(`\\.${name}\\s*=\\s*\\{`).test(code));
+
+  if (unassignedCallbacks.length === 0) {
+    return [];
+  }
+
+  const callbackNames = unassignedCallbacks.join(", ");
+
+  return [
+    {
+      id: `cell-callback-retain-cycle-${sanitizeId(classInfo.name)}`,
+      title: `Check how ${classInfo.name} callbacks are assigned`,
+      risk: "Low",
+      fileName,
+      pattern: "Cell closure callback risk",
+      retainChain: `ViewController → TableView/CollectionView → ${classInfo.name} → ${callbackNames} → ViewController`,
+      whyItHappens: `${classInfo.name} stores callback closures (${callbackNames}), but the code that assigns them is not part of this scan. If the parent ViewController assigns them and captures self strongly, the ViewController may not deallocate.`,
+      fix: "Use [weak self] when assigning these closures from the parent ViewController, and clear them in prepareForReuse. Scan the ViewController together with the cell to check the assignments.",
+      verificationSteps: [
+        "Add deinit print in the ViewController.",
+        "Open the screen.",
+        "Go back or dismiss the screen.",
+        "Check if deinit is printed.",
+        "Open Xcode Memory Graph and search for the ViewController."
+      ]
+    }
+  ];
+}
+
+function getStrongDelegateProperties(scope: ScanScope): string[] {
+  const names: string[] = [];
+  const delegateRegex =
+    /^[ \t]*((?:[@\w]+(?:\([^)]*\))?[ \t]+)*)var[ \t]+(\w*[dD]elegate)[ \t]*:[^\n{=]*(\{)?/gm;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = delegateRegex.exec(scope.topLevelBody)) !== null) {
+    const modifiers = match[1];
+    const propertyName = match[2];
+    const hasAccessorBlock = Boolean(match[3]);
+
+    if (/\b(?:weak|unowned)\b/.test(modifiers)) {
+      continue;
+    }
+
+    if (hasAccessorBlock) {
+      // A computed property stores nothing. Observers (didSet/willSet) mean it is stored.
+      const declarationIndex = scope.body.indexOf(match[0]);
+      const openBraceIndex = declarationIndex + match[0].length - 1;
+      const closeBraceIndex =
+        declarationIndex === -1
+          ? -1
+          : findMatchingBrace(scope.body, openBraceIndex);
+      const accessorBlock =
+        closeBraceIndex === -1
+          ? ""
+          : scope.body.slice(openBraceIndex, closeBraceIndex + 1);
+
+      if (!/\b(?:didSet|willSet)\b/.test(accessorBlock)) {
+        continue;
+      }
+    }
+
+    names.push(propertyName);
+  }
+
+  return names;
+}
+
+function getLifecycleFindings(
+  scope: ScanScope,
+  fileName: string
+): LeakFinding[] {
+  const findings: LeakFinding[] = [];
+  const { name, body } = scope;
+  const idSuffix = name ? `-${sanitizeId(name)}` : "";
+
+  if (/Timer\.scheduledTimer/.test(body) && !/\.invalidate\(\)/.test(body)) {
+    findings.push({
+      id: `timer-without-invalidate${idSuffix}`,
+      title: name
+        ? `Timer in ${name} may retain its target`
+        : "Timer may retain its target",
+      risk: "Medium",
+      fileName,
+      pattern: "Timer lifecycle risk",
+      retainChain: `Timer → ${name ?? "Target/ViewController"}`,
+      whyItHappens:
+        "A scheduled Timer can retain its target or closure. If it is not invalidated, the owner object may not release.",
+      fix: "Invalidate the timer in deinit, viewWillDisappear, or a dedicated cleanup method.",
+      verificationSteps: [
+        "Add timer?.invalidate() in deinit or cleanup.",
+        "Run the screen flow.",
+        "Close the screen.",
+        "Check deinit and Memory Graph."
+      ]
+    });
+  }
+
+  if (
+    /NotificationCenter\.default\.addObserver/.test(body) &&
+    !/NotificationCenter\.default\.removeObserver/.test(body)
+  ) {
+    findings.push({
+      id: `notification-observer-lifecycle-risk${idSuffix}`,
+      title: name
+        ? `NotificationCenter observer lifecycle risk in ${name}`
+        : "NotificationCenter observer lifecycle risk",
+      risk: "Medium",
+      fileName,
+      pattern: "NotificationCenter observer risk",
+      retainChain: `NotificationCenter → ${name ?? "Observer/ViewController"}`,
+      whyItHappens:
+        "Notification observers can keep callbacks active longer than expected. Selector-based observers should be removed when the object is deallocated or cleaned up.",
+      fix: "Remove the observer in deinit or use block-based observers carefully with weak self and stored observer tokens.",
+      verificationSteps: [
+        "Check where addObserver is called.",
+        "Add removeObserver in deinit if needed.",
+        "Close the screen.",
+        "Verify deinit is called.",
+        "Trigger the notification again and confirm old screen does not respond."
+      ]
+    });
+  }
+
+  if (getCallClosures(body, /\.sink\s*[({]/g).some(capturesSelfStrongly)) {
+    findings.push({
+      id: `combine-sink-self-capture${idSuffix}`,
+      title: name
+        ? `Combine sink in ${name} may capture self strongly`
+        : "Combine sink may capture self strongly",
+      risk: "High",
+      fileName,
+      pattern: "Combine sink self capture",
+      retainChain: `${name ?? "Owner"} → AnyCancellable → sink closure → ${
+        name ?? "self"
+      }`,
+      whyItHappens:
+        "Combine subscriptions are usually stored by the owner. If the sink closure captures self strongly, the owner can retain the subscription and the subscription can retain the owner.",
+      fix: "Use [weak self] inside sink closures and store cancellables carefully.",
+      verificationSteps: [
+        "Find the sink closure.",
+        "Add [weak self] to the sink capture list.",
+        "Cancel subscriptions or clear cancellables when appropriate.",
+        "Verify deinit is called after leaving the screen."
+      ]
+    });
+  }
+
+  const taskClosures = getCallClosures(
+    body,
+    /\bTask(?:\.detached)?(?:<[^>]*>)?\s*(?:\([^)]*\)\s*)?\{/g
+  );
+
+  if (taskClosures.some(capturesSelfStrongly)) {
+    findings.push({
+      id: `async-task-self-capture${idSuffix}`,
+      title: name
+        ? `Async Task in ${name} may capture self strongly`
+        : "Async Task may capture self strongly",
+      risk: "Medium",
+      fileName,
+      pattern: "Async Task self capture",
+      retainChain: `Task → closure → ${name ?? "self"}`,
+      whyItHappens:
+        "A Task can keep its closure alive while async work is running. If the closure captures self strongly, the owner may stay in memory until the task completes or gets cancelled.",
+      fix: "Use [weak self] where appropriate and cancel long-running tasks in deinit or lifecycle cleanup.",
+      verificationSteps: [
+        "Check whether the Task is long-running.",
+        "Use [weak self] if the task belongs to a screen lifecycle.",
+        "Store the task if cancellation is needed.",
+        "Cancel the task when the screen closes.",
+        "Verify deinit is called."
+      ]
+    });
+  }
+
+  getStrongDelegateProperties(scope).forEach((propertyName) => {
+    const propertyPath = name ? `${name}.${propertyName}` : propertyName;
+
+    findings.push({
+      id: `strong-delegate-risk${idSuffix}-${sanitizeId(propertyName)}`,
+      title: `${propertyPath} may strongly retain its delegate`,
+      risk: "Medium",
+      fileName,
+      pattern: "Strong delegate risk",
+      retainChain: `${propertyPath} → delegate → Parent/ViewController`,
+      whyItHappens:
+        "Delegate references are usually expected to be weak. A strong delegate can create a retain cycle between parent and child objects.",
+      fix: `Declare ${propertyName} as weak. If the compiler rejects it, make the delegate protocol class-bound with AnyObject.`,
+      verificationSteps: [
+        "Check the delegate protocol.",
+        "Make the protocol class-bound using AnyObject if needed.",
+        "Change the delegate property to weak.",
+        "Verify the parent ViewController deallocates."
+      ]
+    });
+  });
+
+  return findings;
+}
+
 export function scanSwiftCode(
   rawCode: string,
   fileName = "Pasted Swift Code"
@@ -485,36 +861,11 @@ export function scanSwiftCode(
   const classes = extractSwiftClasses(code);
   const classNames = classes.map((swiftClass) => swiftClass.name);
 
-  const hasCellClass =
-    /class\s+\w+\s*:\s*(UITableViewCell|UICollectionViewCell)/.test(code);
-
-  const hasClosureProperty =
-    /var\s+\w+\s*:\s*\(\(.*\)\s*->\s*.*\)\?/.test(code) ||
-    /var\s+\w+\s*:\s*\(\(\)\s*->\s*Void\)\?/.test(code);
-
-  if (hasCellClass && hasClosureProperty) {
-    findings.push({
-      id: "cell-callback-retain-cycle",
-      title: "Possible cell callback retain cycle",
-      risk: "High",
-      fileName,
-      pattern: "Cell closure callback risk",
-      retainChain:
-        "ViewController → TableView/CollectionView → Cell → Closure → ViewController",
-      whyItHappens:
-        "The cell owns a closure property. If the parent ViewController assigns this closure and captures self strongly, the ViewController may not deallocate.",
-      fix: "Use [weak self] when assigning the closure from the parent ViewController. Also clear callback closures during prepareForReuse if the cell stores user action callbacks.",
-      verificationSteps: [
-        "Add deinit print in the ViewController.",
-        "Open the screen.",
-        "Go back or dismiss the screen.",
-        "Check if deinit is printed.",
-        "Open Xcode Memory Graph and search for the ViewController."
-      ]
-    });
-  }
-
   classes.forEach((swiftClass) => {
+    getCellCallbackFindings(swiftClass, code, fileName).forEach((finding) =>
+      addFindingOnce(findings, finding)
+    );
+
     getClosureAssignmentFindings(swiftClass, fileName).forEach((finding) =>
       addFindingOnce(findings, finding)
     );
@@ -532,125 +883,11 @@ export function scanSwiftCode(
     );
   });
 
-  const hasScheduledTimer = /Timer\.scheduledTimer/.test(code);
-  const hasInvalidate = /\.invalidate\(\)/.test(code);
-
-  if (hasScheduledTimer && !hasInvalidate) {
-    findings.push({
-      id: "timer-without-invalidate",
-      title: "Timer may retain its target",
-      risk: "Medium",
-      fileName,
-      pattern: "Timer lifecycle risk",
-      retainChain: "Timer → Target/ViewController",
-      whyItHappens:
-        "A scheduled Timer can retain its target or closure. If it is not invalidated, the owner object may not release.",
-      fix: "Invalidate the timer in deinit, viewWillDisappear, or a dedicated cleanup method.",
-      verificationSteps: [
-        "Add timer?.invalidate() in deinit or cleanup.",
-        "Run the screen flow.",
-        "Close the screen.",
-        "Check deinit and Memory Graph."
-      ]
-    });
-  }
-
-  const hasNotificationObserver = /NotificationCenter\.default\.addObserver/.test(
-    code
-  );
-  const hasRemoveObserver =
-    /NotificationCenter\.default\.removeObserver/.test(code);
-
-  if (hasNotificationObserver && !hasRemoveObserver) {
-    findings.push({
-      id: "notification-observer-lifecycle-risk",
-      title: "NotificationCenter observer lifecycle risk",
-      risk: "Medium",
-      fileName,
-      pattern: "NotificationCenter observer risk",
-      retainChain: "NotificationCenter → Observer/ViewController",
-      whyItHappens:
-        "Notification observers can keep callbacks active longer than expected. Selector-based observers should be removed when the object is deallocated or cleaned up.",
-      fix: "Remove the observer in deinit or use block-based observers carefully with weak self and stored observer tokens.",
-      verificationSteps: [
-        "Check where addObserver is called.",
-        "Add removeObserver in deinit if needed.",
-        "Close the screen.",
-        "Verify deinit is called.",
-        "Trigger the notification again and confirm old screen does not respond."
-      ]
-    });
-  }
-
-  const hasCombineSink = /\.sink\s*\{[\s\S]*self\./.test(code);
-  const hasWeakSelfInSink = /\.sink\s*\{\s*\[weak self\]/.test(code);
-
-  if (hasCombineSink && !hasWeakSelfInSink) {
-    findings.push({
-      id: "combine-sink-self-capture",
-      title: "Combine sink may capture self strongly",
-      risk: "High",
-      fileName,
-      pattern: "Combine sink self capture",
-      retainChain: "Owner → AnyCancellable → sink closure → self",
-      whyItHappens:
-        "Combine subscriptions are usually stored by the owner. If the sink closure captures self strongly, the owner can retain the subscription and the subscription can retain the owner.",
-      fix: "Use [weak self] inside sink closures and store cancellables carefully.",
-      verificationSteps: [
-        "Find the sink closure.",
-        "Add [weak self] to the sink capture list.",
-        "Cancel subscriptions or clear cancellables when appropriate.",
-        "Verify deinit is called after leaving the screen."
-      ]
-    });
-  }
-
-  const hasTaskSelfCapture = /Task\s*\{[\s\S]*self\./.test(code);
-  const hasWeakSelfInTask = /Task\s*\{\s*\[weak self\]/.test(code);
-
-  if (hasTaskSelfCapture && !hasWeakSelfInTask) {
-    findings.push({
-      id: "async-task-self-capture",
-      title: "Async Task may capture self strongly",
-      risk: "Medium",
-      fileName,
-      pattern: "Async Task self capture",
-      retainChain: "Task → closure → self",
-      whyItHappens:
-        "A Task can keep its closure alive while async work is running. If the closure captures self strongly, the owner may stay in memory until the task completes or gets cancelled.",
-      fix: "Use [weak self] where appropriate and cancel long-running tasks in deinit or lifecycle cleanup.",
-      verificationSteps: [
-        "Check whether the Task is long-running.",
-        "Use [weak self] if the task belongs to a screen lifecycle.",
-        "Store the task if cancellation is needed.",
-        "Cancel the task when the screen closes.",
-        "Verify deinit is called."
-      ]
-    });
-  }
-
-  const hasDelegateProperty = /var\s+\w*delegate\w*\s*:\s*\w+\??/.test(code);
-  const hasWeakDelegate = /weak\s+var\s+\w*delegate\w*/.test(code);
-
-  if (hasDelegateProperty && !hasWeakDelegate) {
-    findings.push({
-      id: "strong-delegate-risk",
-      title: "Delegate may be strongly retained",
-      risk: "Medium",
-      fileName,
-      pattern: "Strong delegate risk",
-      retainChain: "Object → delegate → Parent/ViewController",
-      whyItHappens:
-        "Delegate references are usually expected to be weak. A strong delegate can create a retain cycle between parent and child objects.",
-      fix: "Declare delegate properties as weak when the delegate is a class-bound protocol.",
-      verificationSteps: [
-        "Check the delegate protocol.",
-        "Make the protocol class-bound using AnyObject if needed.",
-        "Change the delegate property to weak.",
-        "Verify the parent ViewController deallocates."
-      ]
-    });
-  }
+  getScanScopes(code, classes).forEach((scope) => {
+    getLifecycleFindings(scope, fileName).forEach((finding) =>
+      addFindingOnce(findings, finding)
+    );
+  });
 
   const assignedClosureMatches = Array.from(
     code.matchAll(/(\w+)\.(\w+)\s*=\s*\{([\s\S]*?)\n\s*\}/g)
